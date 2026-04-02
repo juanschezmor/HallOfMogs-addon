@@ -41,8 +41,10 @@ local createExportFrame
 local playerModelScene
 local getOutfitAppearanceItemID
 local DRESS_UP_FRAME_MODEL_SCENE_ID = 596
+local EXPORT_SCENE_WARMUP_DELAY_SECONDS = 0.15
 local EXPORT_FRAME_SUBTITLE =
   "This exports your visible player appearance first. If WoW does not expose it cleanly, it falls back to transmog APIs and finally the equipped item."
+local exportRenderRequestID = 0
 
 local function loadBlizzardAddon(name)
   if C_AddOns and C_AddOns.LoadAddOn then
@@ -107,7 +109,7 @@ local function normalizeHiddenPlaceholderItemID(slot, itemID)
   return itemID
 end
 
-local function getPlayerActor()
+local function ensurePlayerModelScene()
   ensureTransmogSupport()
 
   if not playerModelScene then
@@ -122,16 +124,25 @@ local function getPlayerActor()
     playerModelScene = modelScene
   end
 
-  if playerModelScene.ClearScene then
-    playerModelScene:ClearScene()
+  return playerModelScene
+end
+
+local function preparePlayerActor()
+  local modelScene = ensurePlayerModelScene()
+  if not modelScene then
+    return nil
   end
 
-  if playerModelScene.ReleaseAllActors then
-    playerModelScene:ReleaseAllActors()
+  if modelScene.ClearScene then
+    modelScene:ClearScene()
   end
 
-  if playerModelScene.TransitionToModelSceneID then
-    playerModelScene:TransitionToModelSceneID(
+  if modelScene.ReleaseAllActors then
+    modelScene:ReleaseAllActors()
+  end
+
+  if modelScene.TransitionToModelSceneID then
+    modelScene:TransitionToModelSceneID(
       DRESS_UP_FRAME_MODEL_SCENE_ID,
       CAMERA_TRANSITION_TYPE_IMMEDIATE,
       CAMERA_MODIFICATION_TYPE_DISCARD,
@@ -145,11 +156,20 @@ local function getPlayerActor()
     local sheatheWeapons = false
     local autoDress = true
     local hideWeapons = false
-    SetupPlayerForModelScene(playerModelScene, nil, nil, sheatheWeapons, autoDress, hideWeapons, useNativeForm)
+    SetupPlayerForModelScene(modelScene, nil, nil, sheatheWeapons, autoDress, hideWeapons, useNativeForm)
   end
 
-  if playerModelScene.GetPlayerActor then
-    return playerModelScene:GetPlayerActor()
+  if modelScene.GetPlayerActor then
+    return modelScene:GetPlayerActor()
+  end
+
+  return nil
+end
+
+local function getPlayerActor()
+  local modelScene = ensurePlayerModelScene()
+  if modelScene and modelScene.GetPlayerActor then
+    return modelScene:GetPlayerActor()
   end
 
   return nil
@@ -308,13 +328,8 @@ local function getTransmogLocation(slotName)
   return TransmogUtil.CreateTransmogLocation(slotName, Enum.TransmogType.Appearance, false)
 end
 
-local function getActorAppearanceItemID(slot)
-  local playerActor = getPlayerActor()
-  if not playerActor then
-    return nil, nil
-  end
-
-  if not playerActor.GetItemTransmogInfo then
+local function resolveActorAppearanceItemID(playerActor, slot)
+  if not playerActor or not playerActor.GetItemTransmogInfo then
     return nil, nil
   end
 
@@ -323,27 +338,62 @@ local function getActorAppearanceItemID(slot)
     return nil, nil
   end
 
-  local itemID = itemTransmogInfo.itemID
-  if type(itemID) == "number" and itemID > 0 then
-    return itemID, itemTransmogInfo
-  end
-
+  local actorItemID = itemTransmogInfo.itemID
   local sourceID = extractSourceID(itemTransmogInfo)
   local sourceItemID = getSourceItemID(sourceID)
   if sourceItemID == 0 then
-    return 0, itemTransmogInfo
+    return 0, itemTransmogInfo, actorItemID, sourceID, sourceItemID, nil, nil, "source-hidden"
   end
 
   if sourceItemID and sourceItemID > 0 then
-    return sourceItemID, itemTransmogInfo
+    return sourceItemID, itemTransmogInfo, actorItemID, sourceID, sourceItemID, nil, nil, "source"
   end
 
   local appearanceID = itemTransmogInfo.appearanceID
-  if type(appearanceID) ~= "number" or appearanceID <= 0 then
-    return nil, itemTransmogInfo
+  local appearanceItemID = nil
+  if type(appearanceID) == "number" and appearanceID > 0 then
+    appearanceItemID = getAppearanceItemID(appearanceID)
+    if appearanceItemID == 0 then
+      return 0, itemTransmogInfo, actorItemID, sourceID, sourceItemID, appearanceID, appearanceItemID, "appearance-hidden"
+    end
+
+    if appearanceItemID and appearanceItemID > 0 then
+      return appearanceItemID, itemTransmogInfo, actorItemID, sourceID, sourceItemID, appearanceID, appearanceItemID, "appearance"
+    end
   end
 
-  return getAppearanceItemID(appearanceID), itemTransmogInfo
+  if type(actorItemID) == "number" and actorItemID > 0 then
+    return actorItemID, itemTransmogInfo, actorItemID, sourceID, sourceItemID, appearanceID, appearanceItemID, "item"
+  end
+
+  return nil, itemTransmogInfo, actorItemID, sourceID, sourceItemID, appearanceID, appearanceItemID, "none"
+end
+
+local function getActorAppearanceItemID(slot)
+  local playerActor = getPlayerActor()
+  if not playerActor then
+    return nil, nil
+  end
+
+  local itemID, itemTransmogInfo = resolveActorAppearanceItemID(playerActor, slot)
+  return itemID, itemTransmogInfo
+end
+
+local function inspectActorAppearanceItemID(slot)
+  local playerActor = getPlayerActor()
+  local itemID, itemTransmogInfo, actorItemID, sourceID, sourceItemID, appearanceID, appearanceItemID, resolution =
+    resolveActorAppearanceItemID(playerActor, slot)
+
+  return {
+    actorItemID = actorItemID,
+    appearanceID = appearanceID,
+    appearanceItemID = appearanceItemID,
+    itemID = itemID,
+    itemTransmogInfo = itemTransmogInfo,
+    resolution = resolution or "none",
+    sourceID = sourceID,
+    sourceItemID = sourceItemID,
+  }
 end
 
 local function getAppliedTransmogSource(slot)
@@ -453,7 +503,11 @@ local function getVisibleItemIDForSlot(slot)
   return 0
 end
 
-local function buildExportCode()
+local function buildExportCode(usePreparedActor)
+  if not usePreparedActor then
+    preparePlayerActor()
+  end
+
   local _, _, classID = UnitClass("player")
   local _, _, raceID = UnitRace("player")
   local bodyType = getBodyType()
@@ -694,10 +748,14 @@ getOutfitAppearanceItemID = function(slot)
   return nil, activeOutfitID, nil
 end
 
-local function buildDebugDump()
+local function buildDebugDump(usePreparedActor)
+  if not usePreparedActor then
+    preparePlayerActor()
+  end
+
   local lines = {
     "Hall of Mogs debug",
-    "export=" .. buildExportCode(),
+    "export=" .. buildExportCode(true),
     "",
   }
 
@@ -724,7 +782,8 @@ local function buildDebugDump()
         outfitSourceResults[#outfitSourceResults + 1] = string.format("%d:unavailable", outfitSlot)
       end
     end
-    local rawActorItemID = getActorAppearanceItemID(slot)
+    local actorInspection = inspectActorAppearanceItemID(slot)
+    local rawActorItemID = actorInspection.itemID
     local actorItemID = normalizeHiddenPlaceholderItemID(slot, rawActorItemID)
     local outfitItemID = normalizeHiddenPlaceholderItemID(slot, getOutfitAppearanceItemID(slot))
     local playerActor = getPlayerActor()
@@ -741,6 +800,12 @@ local function buildDebugDump()
     lines[#lines + 1] = "  appliedSourceID=" .. tostring(appliedSourceID or 0)
     lines[#lines + 1] = "  resolvedItemID=" .. tostring(resolvedItemID or 0)
     lines[#lines + 1] = "  rawActorItemID=" .. tostring(rawActorItemID or 0)
+    lines[#lines + 1] = "  actorResolution=" .. tostring(actorInspection.resolution)
+    lines[#lines + 1] = "  actorItemTransmogInfo.itemID=" .. tostring(actorInspection.actorItemID or 0)
+    lines[#lines + 1] = "  actorSourceID=" .. tostring(actorInspection.sourceID or 0)
+    lines[#lines + 1] = "  actorSourceItemID=" .. tostring(actorInspection.sourceItemID or 0)
+    lines[#lines + 1] = "  actorAppearanceID=" .. tostring(actorInspection.appearanceID or 0)
+    lines[#lines + 1] = "  actorAppearanceItemID=" .. tostring(actorInspection.appearanceItemID or 0)
     lines[#lines + 1] = "  actorItemID=" .. tostring(actorItemID or 0)
     lines[#lines + 1] = "  outfitItemID=" .. tostring(outfitItemID or 0)
     lines[#lines + 1] = "  exportedItemID=" .. tostring(exportedItemID or 0)
@@ -830,20 +895,45 @@ createExportFrame = function()
   return frame
 end
 
+local function showPreparedFrame(title, subtitleText, loadingText, contentBuilder, refreshAction)
+  exportRenderRequestID = exportRenderRequestID + 1
+  local requestID = exportRenderRequestID
+
+  populateFrame(title, subtitleText, loadingText, refreshAction)
+  preparePlayerActor()
+
+  local function renderPreparedContent()
+    if requestID ~= exportRenderRequestID then
+      return
+    end
+
+    populateFrame(title, subtitleText, contentBuilder(true), refreshAction)
+  end
+
+  if C_Timer and C_Timer.After then
+    C_Timer.After(EXPORT_SCENE_WARMUP_DELAY_SECONDS, renderPreparedContent)
+    return
+  end
+
+  renderPreparedContent()
+end
+
 local function showExportFrame()
-  populateFrame(
+  showPreparedFrame(
     "Hall of Mogs Export",
     EXPORT_FRAME_SUBTITLE,
-    buildExportCode(),
+    "Preparing visible appearance...",
+    buildExportCode,
     showExportFrame
   )
 end
 
 local function showDebugFrame()
-  populateFrame(
+  showPreparedFrame(
     "Hall of Mogs Debug",
     "Use this dump to inspect what Blizzard returns for every transmog slot.",
-    buildDebugDump(),
+    "Preparing debug dump...",
+    buildDebugDump,
     showDebugFrame
   )
 end
