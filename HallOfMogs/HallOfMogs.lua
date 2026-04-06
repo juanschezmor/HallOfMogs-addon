@@ -46,6 +46,16 @@ local EXPORT_FRAME_SUBTITLE =
   "This exports your visible player appearance first. If WoW does not expose it cleanly, it falls back to transmog APIs and finally the equipped item."
 local exportRenderRequestID = 0
 
+local function findExportSlot(slotName)
+  for _, slot in ipairs(EXPORT_SLOTS) do
+    if slot.slotName == slotName then
+      return slot
+    end
+  end
+
+  return nil
+end
+
 local function loadBlizzardAddon(name)
   if C_AddOns and C_AddOns.LoadAddOn then
     pcall(C_AddOns.LoadAddOn, name)
@@ -318,17 +328,54 @@ local function extractSourceID(value)
   return nil
 end
 
-local function getTransmogLocation(slotName)
+local function getTransmogLocation(slotName, isSecondary, transmogType)
   ensureTransmogSupport()
 
   if not (TransmogUtil and Enum and Enum.TransmogType) then
     return nil
   end
 
-  return TransmogUtil.CreateTransmogLocation(slotName, Enum.TransmogType.Appearance, false)
+  return TransmogUtil.CreateTransmogLocation(
+    slotName,
+    transmogType or Enum.TransmogType.Appearance,
+    isSecondary and true or false
+  )
 end
 
-local function resolveActorAppearanceItemID(playerActor, slot)
+local function hasSecondaryShoulderTransmog()
+  ensureTransmogSupport()
+
+  if
+    not (
+      TransmogUtil
+      and TransmogUtil.GetSlotID
+      and TransmogUtil.IsSecondaryTransmoggedForItemLocation
+      and ItemLocation
+      and ItemLocation.CreateFromEquipmentSlot
+    )
+  then
+    return false
+  end
+
+  local shoulderSlotID = TransmogUtil.GetSlotID("SHOULDERSLOT")
+  if type(shoulderSlotID) ~= "number" then
+    return false
+  end
+
+  local itemLocation = ItemLocation:CreateFromEquipmentSlot(shoulderSlotID)
+  if not itemLocation then
+    return false
+  end
+
+  local ok, isSecondaryTransmogged = pcall(TransmogUtil.IsSecondaryTransmoggedForItemLocation, itemLocation)
+  return ok and isSecondaryTransmogged and true or false
+end
+
+local function resolveActorAppearanceItemID(playerActor, slot, isSecondary)
+  if isSecondary then
+    return nil, nil
+  end
+
   if not playerActor or not playerActor.GetItemTransmogInfo then
     return nil, nil
   end
@@ -369,14 +416,55 @@ local function resolveActorAppearanceItemID(playerActor, slot)
   return nil, itemTransmogInfo, actorItemID, sourceID, sourceItemID, appearanceID, appearanceItemID, "none"
 end
 
-local function getActorAppearanceItemID(slot)
+local function getActorAppearanceItemID(slot, isSecondary)
   local playerActor = getPlayerActor()
   if not playerActor then
     return nil, nil
   end
 
-  local itemID, itemTransmogInfo = resolveActorAppearanceItemID(playerActor, slot)
+  local itemID, itemTransmogInfo = resolveActorAppearanceItemID(playerActor, slot, isSecondary)
   return itemID, itemTransmogInfo
+end
+
+local function getActorWeaponIllusionID(slot)
+  local playerActor = getPlayerActor()
+  if not playerActor or not playerActor.GetItemTransmogInfo then
+    return nil
+  end
+
+  local ok, itemTransmogInfo = pcall(playerActor.GetItemTransmogInfo, playerActor, slot.inventorySlotID)
+  if not ok or type(itemTransmogInfo) ~= "table" then
+    return nil
+  end
+
+  local illusionID = itemTransmogInfo.illusionID
+  if type(illusionID) == "number" and illusionID > 0 then
+    return illusionID
+  end
+
+  return nil
+end
+
+local function getWeaponIllusionStrings(illusionID)
+  if type(illusionID) ~= "number" or illusionID <= 0 then
+    return nil
+  end
+
+  if not (C_TransmogCollection and C_TransmogCollection.GetIllusionStrings) then
+    return nil
+  end
+
+  local ok, name, hyperlink, sourceText = pcall(C_TransmogCollection.GetIllusionStrings, illusionID)
+  if not ok then
+    return nil
+  end
+
+  return {
+    hyperlink = type(hyperlink) == "string" and hyperlink ~= "" and hyperlink or nil,
+    itemId = extractItemIDFromLink(hyperlink),
+    name = type(name) == "string" and name ~= "" and name or nil,
+    sourceText = type(sourceText) == "string" and sourceText ~= "" and sourceText or nil,
+  }
 end
 
 local function inspectActorAppearanceItemID(slot)
@@ -396,8 +484,8 @@ local function inspectActorAppearanceItemID(slot)
   }
 end
 
-local function getAppliedTransmogSource(slot)
-  local transmogLocation = getTransmogLocation(slot.slotName)
+local function getAppliedTransmogSource(slot, isSecondary)
+  local transmogLocation = getTransmogLocation(slot.slotName, isSecondary, Enum.TransmogType.Appearance)
   local locationData = transmogLocation and transmogLocation.GetData and transmogLocation:GetData() or transmogLocation
   local isTransmogrified = false
 
@@ -458,17 +546,102 @@ local function getAppliedTransmogSource(slot)
   return nil, false, isTransmogrified
 end
 
-local function getVisibleItemIDForSlot(slot)
-  local actorItemID = normalizeHiddenPlaceholderItemID(slot, getActorAppearanceItemID(slot))
-  if actorItemID == 0 then
-    return 0
+local function extractIllusionName(illusionInfo)
+  if type(illusionInfo) ~= "table" then
+    return nil
   end
 
-  if actorItemID and actorItemID > 0 then
-    return actorItemID
+  for _, candidate in ipairs({
+    illusionInfo.name,
+    illusionInfo.label,
+    illusionInfo.text,
+  }) do
+    if type(candidate) == "string" and candidate ~= "" then
+      return candidate
+    end
   end
 
-  local appliedSourceID, isHidden, isTransmogrified = getAppliedTransmogSource(slot)
+  return nil
+end
+
+local function getWeaponIllusionInfo(illusionID)
+  if type(illusionID) ~= "number" or illusionID <= 0 then
+    return nil
+  end
+
+  local locale = type(GetLocale) == "function" and GetLocale() or nil
+  local name = nil
+  local sourceID = nil
+  local visualID = nil
+  local illusionStrings = getWeaponIllusionStrings(illusionID)
+
+  name = illusionStrings and illusionStrings.name or nil
+
+  if C_TransmogCollection and C_TransmogCollection.GetIllusionInfo then
+    local ok, illusionInfo = pcall(C_TransmogCollection.GetIllusionInfo, illusionID)
+    if ok and type(illusionInfo) == "table" then
+      name = name or extractIllusionName(illusionInfo)
+      if type(illusionInfo.sourceID) == "number" and illusionInfo.sourceID > 0 then
+        sourceID = illusionInfo.sourceID
+      end
+
+      if type(illusionInfo.visualID) == "number" and illusionInfo.visualID > 0 then
+        visualID = illusionInfo.visualID
+      end
+    end
+  end
+
+  if (not name or not visualID) and C_TransmogCollection and C_TransmogCollection.GetIllusions then
+    local ok, illusions = pcall(C_TransmogCollection.GetIllusions)
+    if ok and type(illusions) == "table" then
+      for _, illusion in ipairs(illusions) do
+        if type(illusion.sourceID) == "number" and sourceID and illusion.sourceID == sourceID then
+          name = name or extractIllusionName(illusion)
+
+          if not visualID and type(illusion.visualID) == "number" and illusion.visualID > 0 then
+            visualID = illusion.visualID
+          end
+
+          break
+        end
+      end
+    end
+  end
+
+  return {
+    hyperlink = illusionStrings and illusionStrings.hyperlink or nil,
+    illusionId = illusionID,
+    itemId = illusionStrings and illusionStrings.itemId or nil,
+    locale = type(locale) == "string" and locale ~= "" and locale or nil,
+    name = name,
+    sourceId = sourceID,
+    sourceText = illusionStrings and illusionStrings.sourceText or nil,
+    visualId = visualID,
+  }
+end
+
+local function getAppliedWeaponIllusion(slot)
+  return getWeaponIllusionInfo(getActorWeaponIllusionID(slot))
+end
+
+local function getVisibleItemIDForSlot(slot, options)
+  local isSecondary = options and options.isSecondary
+  local skipActor = options and options.skipActor
+  local outfitSlotID = options and options.outfitSlotID
+  local allowEquippedFallback = not options or options.allowEquippedFallback ~= false
+
+  if not skipActor then
+    local actorItemID = normalizeHiddenPlaceholderItemID(slot, getActorAppearanceItemID(slot, isSecondary))
+    if actorItemID == 0 then
+      return 0
+    end
+
+    if actorItemID and actorItemID > 0 then
+      return actorItemID
+    end
+  end
+
+  local appliedSourceID, isHidden, isTransmogrified = getAppliedTransmogSource(slot, isSecondary)
   if isHidden then
     return 0
   end
@@ -482,7 +655,7 @@ local function getVisibleItemIDForSlot(slot)
     return transmogItemID
   end
 
-  local outfitItemID = normalizeHiddenPlaceholderItemID(slot, getOutfitAppearanceItemID(slot))
+  local outfitItemID = normalizeHiddenPlaceholderItemID(slot, getOutfitAppearanceItemID(slot, outfitSlotID))
   if outfitItemID == 0 then
     return 0
   end
@@ -495,12 +668,84 @@ local function getVisibleItemIDForSlot(slot)
     return 0
   end
 
-  local equippedItemID = GetInventoryItemID("player", slot.inventorySlotID)
-  if equippedItemID and equippedItemID > 0 then
-    return equippedItemID
+  if allowEquippedFallback then
+    local equippedItemID = GetInventoryItemID("player", slot.inventorySlotID)
+    if equippedItemID and equippedItemID > 0 then
+      return equippedItemID
+    end
   end
 
   return 0
+end
+
+local function buildExportCustomizationsSegment(gearCustomizations)
+  local parts = {}
+
+  if gearCustomizations and gearCustomizations.splitShoulders then
+    parts[#parts + 1] = "splitShoulders=1"
+
+    if gearCustomizations.leftShoulderItemId and gearCustomizations.leftShoulderItemId > 0 then
+      parts[#parts + 1] = "leftShoulderItemId=" .. tostring(gearCustomizations.leftShoulderItemId)
+    end
+
+    if gearCustomizations.rightShoulderItemId and gearCustomizations.rightShoulderItemId > 0 then
+      parts[#parts + 1] = "rightShoulderItemId=" .. tostring(gearCustomizations.rightShoulderItemId)
+    end
+  end
+
+  local function appendWeaponIllusion(prefix, illusion)
+    if type(illusion) ~= "table" then
+      return
+    end
+
+    if type(illusion.illusionId) == "number" and illusion.illusionId > 0 then
+      parts[#parts + 1] = prefix .. "IllusionId=" .. tostring(illusion.illusionId)
+    end
+
+    if type(illusion.visualId) == "number" and illusion.visualId > 0 then
+      parts[#parts + 1] = prefix .. "IllusionVisualId=" .. tostring(illusion.visualId)
+    end
+
+    if type(illusion.name) == "string" and illusion.name ~= "" then
+      parts[#parts + 1] = prefix .. "IllusionName=" .. urlEncode(illusion.name)
+    end
+
+    if type(illusion.locale) == "string" and illusion.locale ~= "" then
+      parts[#parts + 1] = prefix .. "IllusionLocale=" .. urlEncode(illusion.locale)
+    end
+  end
+
+  appendWeaponIllusion("mainHand", gearCustomizations and gearCustomizations.mainHandIllusion or nil)
+  appendWeaponIllusion("offHand", gearCustomizations and gearCustomizations.offHandIllusion or nil)
+
+  return table.concat(parts, "&")
+end
+
+local function resolveShoulderExportData(slot)
+  local primaryShoulderItemID = getVisibleItemIDForSlot(slot)
+  local secondaryShoulderItemID = getVisibleItemIDForSlot(slot, {
+    allowEquippedFallback = false,
+    isSecondary = true,
+    outfitSlotID = 2,
+    skipActor = true,
+  })
+  local splitShouldersFromHelper = hasSecondaryShoulderTransmog()
+  local splitShoulders =
+    splitShouldersFromHelper
+    or (
+      type(primaryShoulderItemID) == "number"
+      and type(secondaryShoulderItemID) == "number"
+      and primaryShoulderItemID > 0
+      and secondaryShoulderItemID > 0
+      and primaryShoulderItemID ~= secondaryShoulderItemID
+    )
+
+  return {
+    leftShoulderItemId = primaryShoulderItemID,
+    rightShoulderItemId = secondaryShoulderItemID,
+    splitShoulders = splitShoulders,
+    splitShouldersFromHelper = splitShouldersFromHelper,
+  }
 end
 
 local function buildExportCode(usePreparedActor)
@@ -514,19 +759,39 @@ local function buildExportCode(usePreparedActor)
   local armorType = getArmorType(classID)
   local characterName = urlEncode(UnitName("player") or "")
   local slotValues = {}
+  local gearCustomizations = nil
 
   for _, slot in ipairs(EXPORT_SLOTS) do
-    slotValues[#slotValues + 1] = tostring(getVisibleItemIDForSlot(slot))
+    if slot.slotName == "SHOULDERSLOT" then
+      gearCustomizations = resolveShoulderExportData(slot)
+
+      if gearCustomizations.splitShoulders then
+        -- Blizzard exposes the shoulder split as primary + secondary transmog locations.
+        slotValues[#slotValues + 1] = "0"
+      else
+        slotValues[#slotValues + 1] = tostring(gearCustomizations.leftShoulderItemId or 0)
+      end
+    else
+      slotValues[#slotValues + 1] = tostring(getVisibleItemIDForSlot(slot))
+    end
   end
 
+  gearCustomizations = gearCustomizations or {}
+
+  local mainHandSlot = findExportSlot("MAINHANDSLOT")
+  local offHandSlot = findExportSlot("SECONDARYHANDSLOT")
+  gearCustomizations.mainHandIllusion = mainHandSlot and getAppliedWeaponIllusion(mainHandSlot) or nil
+  gearCustomizations.offHandIllusion = offHandSlot and getAppliedWeaponIllusion(offHandSlot) or nil
+
   return string.format(
-    "v2|%d|%d|%s|%s|%s|%s",
+    "v3|%d|%d|%s|%s|%s|%s|%s",
     classID or 0,
     raceID or 0,
     bodyType,
     armorType,
     characterName,
-    table.concat(slotValues, ",")
+    table.concat(slotValues, ","),
+    buildExportCustomizationsSegment(gearCustomizations)
   )
 end
 
@@ -702,7 +967,7 @@ local function describeCallResults(results)
   return table.concat(parts, " | ")
 end
 
-getOutfitAppearanceItemID = function(slot)
+getOutfitAppearanceItemID = function(slot, outfitSlotOverride)
   ensureTransmogSupport()
 
   if not C_TransmogOutfitInfo then
@@ -714,7 +979,9 @@ getOutfitAppearanceItemID = function(slot)
     return nil, nil, nil
   end
 
-  for _, outfitSlot in ipairs(slot.outfitSlots or {}) do
+  local outfitSlots = outfitSlotOverride and { outfitSlotOverride } or slot.outfitSlots or {}
+
+  for _, outfitSlot in ipairs(outfitSlots) do
     local ok, sourceIDs = pcall(C_TransmogOutfitInfo.GetSourceIDsForSlot, activeOutfitID, outfitSlot)
     if ok and type(sourceIDs) == "table" then
       local firstValue = firstSourceValue(sourceIDs)
@@ -762,10 +1029,34 @@ local function buildDebugDump(usePreparedActor)
   for _, slot in ipairs(EXPORT_SLOTS) do
     local transmogLocation = getTransmogLocation(slot.slotName)
     local locationData = transmogLocation and transmogLocation.GetData and transmogLocation:GetData() or transmogLocation
+    local secondaryTransmogLocation =
+      slot.slotName == "SHOULDERSLOT" and getTransmogLocation(slot.slotName, true, Enum.TransmogType.Appearance) or nil
+    local secondaryLocationData =
+      secondaryTransmogLocation and secondaryTransmogLocation.GetData and secondaryTransmogLocation:GetData()
+      or secondaryTransmogLocation
     local slotInfoResults = collectCallResults(C_Transmog and C_Transmog.GetSlotInfo, transmogLocation)
     local visualInfoBySlotIDResults = collectCallResults(C_Transmog and C_Transmog.GetSlotVisualInfo, slot.inventorySlotID)
     local visualInfoByLocationResults = collectCallResults(C_Transmog and C_Transmog.GetSlotVisualInfo, locationData)
     local equippedInfoResults = collectCallResults(TransmogUtil and TransmogUtil.GetInfoForEquippedSlot, transmogLocation)
+    local illusionTransmogLocation =
+      (slot.slotName == "MAINHANDSLOT" or slot.slotName == "SECONDARYHANDSLOT")
+        and getTransmogLocation(slot.slotName, false, Enum.TransmogType.Illusion)
+      or nil
+    local illusionEquippedInfoResults =
+      illusionTransmogLocation
+        and collectCallResults(TransmogUtil and TransmogUtil.GetInfoForEquippedSlot, illusionTransmogLocation)
+      or nil
+    local secondarySlotInfoResults =
+      slot.slotName == "SHOULDERSLOT" and collectCallResults(C_Transmog and C_Transmog.GetSlotInfo, secondaryTransmogLocation)
+      or nil
+    local secondaryVisualInfoResults =
+      slot.slotName == "SHOULDERSLOT"
+        and collectCallResults(C_Transmog and C_Transmog.GetSlotVisualInfo, secondaryLocationData)
+      or nil
+    local secondaryEquippedInfoResults =
+      slot.slotName == "SHOULDERSLOT"
+        and collectCallResults(TransmogUtil and TransmogUtil.GetInfoForEquippedSlot, secondaryTransmogLocation)
+      or nil
     local outfitActiveResults = collectCallResults(C_TransmogOutfitInfo and C_TransmogOutfitInfo.GetActiveOutfitID)
     local activeOutfitID = C_TransmogOutfitInfo and C_TransmogOutfitInfo.GetActiveOutfitID and C_TransmogOutfitInfo.GetActiveOutfitID()
     local outfitSourceResults = {}
@@ -789,9 +1080,22 @@ local function buildDebugDump(usePreparedActor)
     local playerActor = getPlayerActor()
     local modelTransmogInfoResults = collectCallResults(playerActor and playerActor.GetItemTransmogInfo, playerActor, slot.inventorySlotID)
     local appliedSourceID, isHidden, isTransmogrified = getAppliedTransmogSource(slot)
+    local secondaryAppliedSourceID, secondaryIsHidden, secondaryIsTransmogrified = nil, nil, nil
+    if slot.slotName == "SHOULDERSLOT" then
+      secondaryAppliedSourceID, secondaryIsHidden, secondaryIsTransmogrified = getAppliedTransmogSource(slot, true)
+    end
     local resolvedItemID = getSourceItemID(appliedSourceID)
     local equippedItemID = GetInventoryItemID("player", slot.inventorySlotID)
     local exportedItemID = getVisibleItemIDForSlot(slot)
+    local shoulderExportData = slot.slotName == "SHOULDERSLOT" and resolveShoulderExportData(slot) or nil
+    local weaponIllusion =
+      (slot.slotName == "MAINHANDSLOT" or slot.slotName == "SECONDARYHANDSLOT")
+        and getAppliedWeaponIllusion(slot)
+      or nil
+    local weaponIllusionStringsResults =
+      weaponIllusion and weaponIllusion.illusionId
+        and collectCallResults(C_TransmogCollection and C_TransmogCollection.GetIllusionStrings, weaponIllusion.illusionId)
+      or nil
 
     lines[#lines + 1] = string.format("%s (%d)", slot.slotName, slot.inventorySlotID)
     lines[#lines + 1] = "  equippedItemID=" .. tostring(equippedItemID or 0)
@@ -817,6 +1121,39 @@ local function buildDebugDump(usePreparedActor)
     lines[#lines + 1] = "  GetSlotVisualInfo(slotID)=" .. describeCallResults(visualInfoBySlotIDResults)
     lines[#lines + 1] = "  GetSlotVisualInfo(locationData)=" .. describeCallResults(visualInfoByLocationResults)
     lines[#lines + 1] = "  GetInfoForEquippedSlot=" .. describeCallResults(equippedInfoResults)
+    if weaponIllusion then
+      lines[#lines + 1] = "  illusionID=" .. tostring(weaponIllusion.illusionId or 0)
+      lines[#lines + 1] = "  illusionItemID=" .. tostring(weaponIllusion.itemId or 0)
+      lines[#lines + 1] = "  illusionLocale=" .. tostring(weaponIllusion.locale or "")
+      lines[#lines + 1] = "  illusionSourceID=" .. tostring(weaponIllusion.sourceId or 0)
+      lines[#lines + 1] = "  illusionVisualID=" .. tostring(weaponIllusion.visualId or 0)
+      lines[#lines + 1] = "  illusionName=" .. tostring(weaponIllusion.name or "")
+      lines[#lines + 1] = "  illusionHyperlink=" .. tostring(weaponIllusion.hyperlink or "")
+      lines[#lines + 1] = "  illusionSourceText=" .. tostring(weaponIllusion.sourceText or "")
+      lines[#lines + 1] =
+        "  illusionGetIllusionStrings=" .. describeCallResults(weaponIllusionStringsResults)
+      lines[#lines + 1] =
+        "  illusionGetInfoForEquippedSlot=" .. describeCallResults(illusionEquippedInfoResults)
+    end
+    if shoulderExportData then
+      lines[#lines + 1] =
+        "  secondaryShoulderDetected=" .. tostring(shoulderExportData.splitShoulders)
+      lines[#lines + 1] =
+        "  secondaryShoulderDetectedByHelper=" .. tostring(shoulderExportData.splitShouldersFromHelper)
+      lines[#lines + 1] =
+        "  secondaryAppliedSourceID=" .. tostring(secondaryAppliedSourceID or 0)
+      lines[#lines + 1] =
+        "  secondaryIsTransmogrified=" .. tostring(secondaryIsTransmogrified)
+      lines[#lines + 1] = "  secondaryIsHidden=" .. tostring(secondaryIsHidden)
+      lines[#lines + 1] =
+        "  secondaryExportedItemID=" .. tostring(shoulderExportData.rightShoulderItemId or 0)
+      lines[#lines + 1] =
+        "  secondaryGetSlotInfo=" .. describeCallResults(secondarySlotInfoResults)
+      lines[#lines + 1] =
+        "  secondaryGetSlotVisualInfo(locationData)=" .. describeCallResults(secondaryVisualInfoResults)
+      lines[#lines + 1] =
+        "  secondaryGetInfoForEquippedSlot=" .. describeCallResults(secondaryEquippedInfoResults)
+    end
     lines[#lines + 1] = ""
   end
 

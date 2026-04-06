@@ -11,6 +11,8 @@ Website:
 ## Features
 
 - Exports the look your character is visibly wearing, not just the raw equipped item IDs
+- Detects split shoulder transmogs and exports left + right shoulders separately
+- Exports main hand and off hand weapon illusion data when WoW exposes it
 - Handles hidden visuals such as hidden tabards
 - Falls back through multiple Blizzard transmog APIs when one path does not expose the visible item cleanly
 - Opens a copy-ready window with the export already selected
@@ -19,8 +21,8 @@ Website:
 ## Compatibility
 
 - Game version: World of Warcraft Retail
-- Addon version: `0.1.0`
-- Export format: `v2`
+- Addon version: `0.2.0`
+- Export format: `v3`
 
 ## Installation
 
@@ -57,13 +59,13 @@ Website:
 The addon exports this structure:
 
 ```text
-v2|classId|raceId|bodyType|armorType|characterName|head,shoulder,back,chest,shirt,tabard,wrist,hands,waist,legs,feet,mainHand,offHand
+v3|classId|raceId|bodyType|armorType|characterName|head,shoulder,back,chest,shirt,tabard,wrist,hands,waist,legs,feet,mainHand,offHand|customizations
 ```
 
 Example:
 
 ```text
-v2|7|91|masculine|mail|Thrall|249648,249650,260312,249645,0,246795,249652,257203,249303,249324,249320,251083,251105
+v3|7|91|masculine|mail|Thrall|249648,0,260312,249645,0,246795,249652,257203,249303,249324,249320,251083,251105|splitShoulders=1&leftShoulderItemId=249650&rightShoulderItemId=249651&mainHandIllusionId=5393&mainHandIllusionVisualId=103&mainHandIllusionName=Crusader&mainHandIllusionLocale=enUS
 ```
 
 ## What the addon exports
@@ -87,6 +89,12 @@ v2|7|91|masculine|mail|Thrall|249648,249650,260312,249645,0,246795,249652,257203
   - feet
   - main hand
   - off hand
+- Optional customizations for:
+  - split shoulders
+  - left shoulder item ID
+  - right shoulder item ID
+  - main hand illusion ID, visual ID, localized name, and locale
+  - off hand illusion ID, visual ID, localized name, and locale
 
 `0` means the slot is hidden or empty.
 

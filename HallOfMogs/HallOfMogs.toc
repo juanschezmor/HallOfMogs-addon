@@ -2,6 +2,6 @@
 ## Title: Hall of Mogs
 ## Notes: Export your current transmog for hallofmogs.com
 ## Author: Juan S.
-## Version: 0.1.1
+## Version: 0.2.0
 
 HallOfMogs.lua
